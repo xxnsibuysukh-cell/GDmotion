@@ -1,0 +1,114 @@
+name: Build GDmotion
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - name: Windows
+            os: windows-latest
+          - name: Android32
+            os: ubuntu-latest
+            target: Android32
+          - name: Android64
+            os: ubuntu-latest
+            target: Android64
+
+    name: ${{ matrix.config.name }}
+    runs-on: ${{ matrix.config.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack gdmotion-source.zip (if it exists)
+        shell: bash
+        run: |
+          PY=""
+          for candidate in python3 python py; do
+            if "$candidate" -c "import sys" >/dev/null 2>&1; then
+              PY="$candidate"
+              break
+            fi
+          done
+          if [ -z "$PY" ]; then
+            echo "::error::No Python found on this runner, cannot unpack gdmotion-source.zip."
+            exit 1
+          fi
+          echo "PY=$PY" >> "$GITHUB_ENV"
+          "$PY" - <<'PYEOF'
+          import os, pathlib, shutil, zipfile
+          z = "gdmotion-source.zip"
+          if not os.path.exists(z):
+              print("No " + z + " in the repository; using the repository files as they are.")
+          else:
+              tmp = pathlib.Path("_src_unzipped")
+              shutil.rmtree(tmp, ignore_errors=True)
+              with zipfile.ZipFile(z) as zf:
+                  zf.extractall(tmp)
+              items = [p for p in tmp.iterdir() if p.name != "__MACOSX"]
+              root = items[0] if len(items) == 1 and items[0].is_dir() else tmp
+              shutil.copytree(
+                  root, ".", dirs_exist_ok=True,
+                  ignore=shutil.ignore_patterns(".github", ".git", "__MACOSX"),
+              )
+              shutil.rmtree(tmp, ignore_errors=True)
+              print("Unpacked " + z + " (project root inside the zip: " + str(root) + ")")
+          PYEOF
+
+      - name: Check project files
+        shell: bash
+        run: |
+          missing=0
+          for f in CMakeLists.txt mod.json; do
+            if [ ! -f "$f" ]; then
+              echo "::error::$f was not found at the repository root. Upload gdmotion-source.zip to the repository root (next to the .github folder) and run the workflow again."
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+          echo "Found CMakeLists.txt and mod.json"
+
+      - name: Read Geode version from mod.json
+        id: ver
+        shell: bash
+        run: |
+          # mod.json holds the bare version (for example 5.11.2); the build action wants the tag name (v5.11.2).
+          sdk=$("$PY" -c "import json; v = str(json.load(open('mod.json', encoding='utf-8'))['geode']); print('v' + v.lstrip('vV'))")
+          if [ -z "$sdk" ] || [ "$sdk" = "v" ]; then
+            echo "::error::mod.json has no usable \"geode\" field."
+            exit 1
+          fi
+          echo "SDK version passed to the build action: $sdk"
+          echo "sdk=$sdk" >> "$GITHUB_OUTPUT"
+
+      - name: Build the mod
+        uses: geode-sdk/build-geode-mod@main
+        with:
+          combine: true
+          sdk: ${{ steps.ver.outputs.sdk }}
+          target: ${{ matrix.config.target }}
+
+  package:
+    name: Package .geode
+    runs-on: ubuntu-latest
+    needs: [build]
+
+    steps:
+      - uses: geode-sdk/build-geode-mod/combine@main
+        id: combine
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GDmotion-geode
+          path: ${{ steps.combine.outputs.build-output }}
